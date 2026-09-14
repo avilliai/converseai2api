@@ -691,6 +691,7 @@ class CookieManager:
 
     # ── 用量记账 ──────────────────────────────────────────
     def record_usage(self, acc: AccountState) -> None:
+        """Record local statistics only; quota is determined exclusively by /usage."""
         if hasattr(acc, "increment_usage"):
             acc.increment_usage()
         else:
@@ -699,12 +700,10 @@ class CookieManager:
         # 一次成功的请求记账，说明账号当前可用，清零连续失败计数
         acc.fail_count = 0
 
-        quota_exhausted = acc.quota_exhausted
-        if quota_exhausted:
-            acc.mark_quota_exhausted()
-            self.save()
-            if True:
-                try:
+        """quota is never inferred from local request count"""
+        '''
+        if False:
+            try:
                     loop = asyncio.get_running_loop()
                     loop.create_task(self._replenish_active_pool())
                     # 额度耗尽淘汰旧号时，触发预注册以补充被销毁的空缺
@@ -713,6 +712,7 @@ class CookieManager:
                     pass
             return
 
+        '''
         self.save()
         log.info(f"📈 [{acc.email}] 已用: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
 
