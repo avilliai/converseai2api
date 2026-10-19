@@ -61,23 +61,18 @@ class CookieManager:
             return
         try:
             data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
-            purged_exhausted: list[str] = []
             with self._sync_lock:
                 accounts = []
                 for i, d in enumerate(data):
                     if not d.get("cookie_str"):
                         continue
                     acc = AccountState(d, i + 1)
-                    # 恢复 email_jwt（保活时收 OTP 必须）
                     if d.get("email_jwt"):
                         acc.email_jwt = d["email_jwt"]
-                    # 恢复 fail_count（连续失败计数，用于活跃池淘汰判断）
                     acc.fail_count = d.get("fail_count", 0)
                     accounts.append(acc)
                 self.accounts = accounts
             log.info(f"✅ 成功加载账号: {len(self.accounts)} 个")
-            if purged_exhausted:
-                log.info(f"🗑️ 启动时清理已耗尽账号: {purged_exhausted}")
 
             # 恢复活跃池：优先使用持久化的 active_pool 字段；
             # 若文件中没有（旧版本数据/首次升级），则用启发式规则重建。
@@ -107,8 +102,6 @@ class CookieManager:
                 log.info("♻️ 未找到可用的活跃池快照，活跃池将在启动后异步激活补充")
             else:
                 log.info(f"✅ 已恢复活跃池: {len(self.active_pool)} 个账号 {self.active_pool}")
-            if purged_exhausted:
-                self.save()
         except Exception as e:
             log.error(f"解析 tokens 失败: {e}")
 
@@ -192,8 +185,18 @@ class CookieManager:
                     acc.name = data.get("name", acc.name)
                     acc.user_id = data.get("user_id", acc.user_id)
                     acc.healthy = True
+                    acc.disabled = False
+                    acc.fail_count = 0
                     acc.usage_count = data.get("usage_count", acc.usage_count)
-                    # 更新 email_jwt（如果注册时带回来了）
+                    acc.message_limit = data.get("message_limit", acc.message_limit)
+                    acc.message_usage = data.get("message_usage", acc.message_usage)
+                    acc.quota_exhausted_flag = data.get("quota_exhausted", False)
+                    if data.get("password"):
+                        acc.password = data["password"]
+                    if data.get("client_id"):
+                        acc.client_id = data["client_id"]
+                    if data.get("refresh_token"):
+                        acc.refresh_token = data["refresh_token"]
                     if data.get("email_jwt"):
                         acc.email_jwt = data["email_jwt"]
                     return False
@@ -218,22 +221,16 @@ class CookieManager:
         return True
 
     def _discard_account(self, acc: AccountState, reason: str) -> bool:
-        """从账号列表和活跃池永久删除一个不可再用的账号。"""
+        """配额每月重置，不永久删除账号，仅移出活跃池并标记保留数据。"""
+        acc.healthy = False
+        acc.disabled = True
         with self._sync_lock:
-            before = len(self.accounts)
-            self.accounts = [
-                candidate
-                for candidate in self.accounts
-                if candidate is not acc and candidate.index != acc.index
-            ]
             self.active_pool = [
                 idx for idx in self.active_pool if idx != acc.index
             ]
-            removed = len(self.accounts) < before
-        if removed:
-            self.save()
-            log.info(f"🗑️ [{acc.email}] 已永久删除，原因: {reason}")
-        return removed
+        self.save()
+        log.info(f"⏸️ [{acc.email}] 已移出活跃池（保留账号数据以备重置），原因: {reason}")
+        return True
 
     async def _evict_from_pool(self, acc: AccountState, reason: str) -> None:
         """将账号请出活跃池（配额耗尽或连续失败），并触发补充。"""

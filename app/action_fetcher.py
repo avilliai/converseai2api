@@ -7,6 +7,7 @@ import json
 import logging
 import urllib.parse
 from curl_cffi.requests import AsyncSession
+from app.config import PROXY
 
 log = logging.getLogger("cosverse_proxy.action_fetcher")
 
@@ -158,7 +159,7 @@ async def fetch_action_config(force: bool = False) -> ActionConfig:
 
     log.info("🔍 正在动态抓取 Next.js action hashes ...")
     try:
-        async with AsyncSession(impersonate=IMPERSONATE, timeout=30) as session:
+        async with AsyncSession(impersonate=IMPERSONATE, timeout=30, proxy=PROXY or None) as session:
             # 1. 抓取登录页 HTML
             html = await _fetch_text(session, f"{COSVERSE_WEB}/auth/signin", is_html=True)
 

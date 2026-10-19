@@ -16,7 +16,13 @@ class AccountState:
         self.message_limit = d.get("message_limit", ACCOUNT_QUOTA)
         self.message_usage = d.get("message_usage", self.usage_count)
         self.quota_exhausted_flag = d.get("quota_exhausted", False)
-        self.fail_count = 0
+        self.fail_count = d.get("fail_count", 0)
+        
+        # Outlook 凭据（用于重新登录/保活和指针恢复）
+        self.password = d.get("password", "")
+        self.client_id = d.get("client_id", "")
+        self.refresh_token = d.get("refresh_token", "")
+        self.email_jwt = d.get("email_jwt", "")
 
     @property
     def remaining(self) -> int:
@@ -76,7 +82,7 @@ class AccountState:
         return res
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "email": self.email,
             "name": self.name,
             "cookie_str": self.cookie_str,
@@ -87,4 +93,14 @@ class AccountState:
             "message_limit": self.message_limit,
             "message_usage": self.message_usage,
             "quota_exhausted": self.quota_exhausted_flag,
+            "fail_count": self.fail_count,
         }
+        if self.password:
+            d["password"] = self.password
+        if self.client_id:
+            d["client_id"] = self.client_id
+        if self.refresh_token:
+            d["refresh_token"] = self.refresh_token
+        if self.email_jwt:
+            d["email_jwt"] = self.email_jwt
+        return d

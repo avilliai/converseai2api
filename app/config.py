@@ -1,17 +1,22 @@
-"""
+﻿"""
 全局常量与配置
 """
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── 文件路径 ──────────────────────────────────────────────
-TOKENS_FILE = Path("./cosverse_tokens.json")
+TOKENS_FILE = Path(os.getenv("TOKENS_FILE", "./cosverse_tokens.json"))
+OUTLOOK_FILE = Path(os.getenv("OUTLOOK_FILE", "./outlook_live_20261018_222014.txt"))
+OUTLOOK_POINTER_FILE = Path(os.getenv("OUTLOOK_POINTER_FILE", "./outlook_pointer.json"))
 
 # ── 上游地址 ──────────────────────────────────────────────
 COSVERSE_WEB = "https://chat.cosverse.ai"
 COSVERSE_API = "https://chat.cosverse.ai/api"
 
-# ── 默认 HTTP 请求头 ──────────────────────────────────────
+# ── 默认 HTTP 请求头 ────────────────────────────────────────
 COMMON_HEADERS: dict[str, str] = {
     "accept-language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
     "sec-ch-ua": '"Microsoft Edge";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
@@ -23,16 +28,14 @@ COMMON_HEADERS: dict[str, str] = {
     ),
 }
 
-# ── Next.js action hashes 和 deployment_id ────────────────
-# 这些值由 Vercel 每次部署时重新生成，不能硬编码。
-# 运行时由 app/action_fetcher.py 动态从页面 JS bundle 抓取，
-# 失败时才使用 action_fetcher.py 内的 _FALLBACK 兜底值。
+# ── 代理配置 ──────────────────────────────────────────────
+PROXY = os.getenv("PROXY") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY") or ""
+HTTP_PROXY = PROXY
+HTTPS_PROXY = PROXY
 
-# ── 代理（可通过环境变量覆盖） ─────────────────────────────
-HTTP_PROXY  = os.getenv("HTTP_PROXY", "")
-HTTPS_PROXY = os.getenv("HTTPS_PROXY", "")
-
-if HTTP_PROXY:
-    os.environ["http_proxy"]  = HTTP_PROXY
-if HTTPS_PROXY:
-    os.environ["https_proxy"] = HTTPS_PROXY
+if PROXY:
+    os.environ["http_proxy"] = PROXY
+    os.environ["https_proxy"] = PROXY
+    os.environ["HTTP_PROXY"] = PROXY
+    os.environ["HTTPS_PROXY"] = PROXY
+    os.environ["ALL_PROXY"] = PROXY

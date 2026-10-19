@@ -18,10 +18,16 @@ from typing import Any, AsyncIterator, Optional
 from curl_cffi import CurlMime
 from curl_cffi.requests import AsyncSession
 
-from app.config import COSVERSE_WEB, COSVERSE_API, COMMON_HEADERS
+from app.config import COSVERSE_WEB, COSVERSE_API, COMMON_HEADERS, PROXY
 from app.action_fetcher import fetch_action_config
 from app.models import AccountState
 from app.email_service import EmailService
+from app.outlook_email_service import (
+    OutlookAccount,
+    OutlookAccountPool,
+    get_folder_highest_uids,
+    wait_for_outlook_code,
+)
 
 log = logging.getLogger("cosverse_proxy.client")
 IMPERSONATE = "chrome110"
@@ -213,7 +219,7 @@ async def upload_file_to_cosverse(
         headers.pop("content-type", None)
         headers.pop("Content-Type", None)
 
-        async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
+        async with AsyncSession(impersonate=IMPERSONATE, timeout=60, proxy=PROXY or None) as session:
             resp = await session.post(
                 R2_UPLOAD_URL,
                 headers=headers,
@@ -260,7 +266,7 @@ async def upload_url_to_cosverse(
             fname = f"upload{ext or '.bin'}"
             return await upload_file_to_cosverse(raw, fname, acc, chat_id, mime)
 
-        async with AsyncSession(impersonate=IMPERSONATE, timeout=30) as session:
+        async with AsyncSession(impersonate=IMPERSONATE, timeout=30, proxy=PROXY or None) as session:
             resp = await session.get(url, timeout=30)
             if resp.status_code != 200:
                 log.warning(f"下载文件失败: {url} -> HTTP {resp.status_code}")
@@ -446,22 +452,24 @@ class _LoginMixin:
 
 class CosverseRegister(_LoginMixin):
     """
-    注册流程：
+    注册客户端：
+    优先使用 Outlook 邮箱账号池（outlook_live_20261018_222014.txt）。
+    流程：
     Step 1  发送邮箱（触发 OTP）
-    Step 2  验证 OTP
-    Step 3  设置用户名（仅注册需要）
+    Step 2  获取 OTP（Outlook IMAP 或 Worker 邮件服务）
+    Step 3  如果为新用户，执行 verify_otp 和 addUserName
     Step 4  nextauth 登录拿 session cookie
     """
 
-    def __init__(self):
-        self.email_service  = EmailService()
-        self.email:    str  = ""
-        self.name:     str  = _random_name()
-        self.otp:      str  = ""
+    def __init__(self, outlook_acc: Optional[OutlookAccount] = None):
+        self.outlook_acc = outlook_acc
+        self.email: str = outlook_acc.address if outlook_acc else ""
+        self.name: str = _random_name()
+        self.otp: str = ""
         self._cookies: dict = {}
-        self.user_id:  str  = ""
-        self._jwt:     str  = ""
-        self._cfg           = None
+        self.user_id: str = ""
+        self._jwt: str = ""
+        self._cfg = None
 
     async def _step_set_name(self, session: AsyncSession) -> bool:
         status, text = await self._post_action(
@@ -475,219 +483,227 @@ class CosverseRegister(_LoginMixin):
         try:
             self._cfg = await fetch_action_config()
 
-            self._jwt, self.email = self.email_service.create_email()
-            if not self.email:
-                raise RuntimeError("邮箱创建失败")
+            # 1. 准备账号
+            is_outlook = False
+            baseline_folders = {'"Junk"': 0, "INBOX": 0}
+            if not self.outlook_acc:
+                try:
+                    pool = OutlookAccountPool()
+                    self.outlook_acc = await pool.get_next_account()
+                except Exception as e:
+                    log.warning(f"从 Outlook 账号池取号失败或文件不存在: {e}")
 
-            async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
+            if self.outlook_acc:
+                is_outlook = True
+                self.email = self.outlook_acc.address
+                self.name = "User" + self.email.split("@")[0][-4:]
+                # 获取发码前的基线 UID
+                baseline_folders = await asyncio.to_thread(
+                    get_folder_highest_uids,
+                    self.outlook_acc.address,
+                    self.outlook_acc.client_id,
+                    self.outlook_acc.refresh_token,
+                )
+            else:
+                # 回退到 worker 邮箱
+                email_service = EmailService()
+                self._jwt, self.email = email_service.create_email()
+                if not self.email:
+                    raise RuntimeError("邮箱创建失败")
+
+            log.info(f"[{self.email}] 开始注册/登录流程 (is_outlook={is_outlook})...")
+
+            async with AsyncSession(impersonate=IMPERSONATE, timeout=60, proxy=PROXY or None) as session:
                 otp_request = await self._step_send_email(session, self.email)
                 if not otp_request:
                     raise RuntimeError("Step1 发送邮箱失败")
-                if otp_request.get("newUser") is False:
-                    raise RuntimeError("邮箱已存在，不能按新账号注册")
+                is_new_user = bool(otp_request.get("newUser"))
 
-                self.otp = await self._wait_for_otp(
-                    self.email_service, self._jwt, self.email
-                )
+                # Step 2: 获取 OTP
+                if is_outlook:
+                    self.otp = await wait_for_outlook_code(
+                        self.outlook_acc.address,
+                        self.outlook_acc.client_id,
+                        self.outlook_acc.refresh_token,
+                        baseline_folders=baseline_folders,
+                        timeout=90,
+                    )
+                else:
+                    self.otp = await self._wait_for_otp(
+                        email_service, self._jwt, self.email
+                    )
+
                 if not self.otp:
                     raise RuntimeError("获取 OTP 超时")
 
-                if not await self._step_verify_otp(session, self.email, self.otp):
-                    raise RuntimeError("Step2 OTP 验证失败")
-
-                if not await self._step_set_name(session):
-                    raise RuntimeError("Step3 设置用户名失败")
-
+                # Step 3: NextAuth 凭据登录拿到 session cookie（注册与登录共用统一接口）
                 self.user_id = await self._step_nextauth_login(
                     session, self.email, self.otp
                 )
                 if not self.user_id:
-                    raise RuntimeError("Step4 next-auth 登录失败")
+                    raise RuntimeError("Step3 next-auth 登录/注册失败")
+
+            cookie_str = _cookies_dict_to_str(self._cookies)
+            limit, usage = 100, 0
+            healthy = True
+            try:
+                from app.usage_client import fetch_usage
+                alive, limits, _ = await fetch_usage(cookie_str)
+                if alive and limits:
+                    limit = int(limits.get("messageLimit", 100) or 100)
+                    usage = int(limits.get("messageUsage", 0) or 0)
+                healthy = alive
+            except Exception as e:
+                log.warning(f"[{self.email}] fetch_usage 失败: {e}")
 
             account = {
-                "email":       self.email,
-                "name":        self.name,
-                "cookie_str":  _cookies_dict_to_str(self._cookies),
-                "user_id":     self.user_id,
-                "email_jwt":   self._jwt,       # 保存邮箱 JWT，供保活使用
-                "healthy":     True,
-                "disabled":    False,
-                "usage_count": 0,
+                "email": self.email,
+                "name": self.name,
+                "cookie_str": cookie_str,
+                "user_id": self.user_id,
+                "healthy": healthy,
+                "disabled": False,
+                "usage_count": usage,
+                "message_limit": limit,
+                "message_usage": usage,
+                "quota_exhausted": False,
             }
-            log.info(f"[{self.email}] ✅ 注册成功 user_id={self.user_id}")
+
+            if is_outlook:
+                account["password"] = self.outlook_acc.password
+                account["client_id"] = self.outlook_acc.client_id
+                account["refresh_token"] = self.outlook_acc.refresh_token
+            if self._jwt:
+                account["email_jwt"] = self._jwt
+
+            log.info(f"[{self.email}] ✅ 注册/登录成功 user_id={self.user_id}")
             return account
 
         except Exception as e:
             log.error(f"CosverseRegister.run() 失败: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             return None
 
 
-# ── 保活客户端 ────────────────────────────────────────────
+# ── 保活/重新登录客户端 ────────────────────────────────────
 
 class CosverseRefresher(_LoginMixin):
     """
-    保活流程（已有邮箱重新登录，跳过设置用户名）：
-    Step 1  发送邮箱（触发 OTP）
-    Step 2  等待并获取 OTP
-    Step 3  验证 OTP
-    Step 4  nextauth 登录拿新 session cookie
+    保活/重新登录客户端：
+    如果账号带有 Outlook 凭据（client_id / refresh_token），直接通过 Outlook IMAP 重新登录并刷新 session cookie。
+    如果是旧版 Worker 邮箱账号，则通过 email_jwt 刷新。
     成功后直接将新 cookie 写回 AccountState 并标记为健康。
     """
 
     def __init__(self, acc: AccountState):
-        self.acc            = acc
-        self.email          = acc.email
-        self.otp:     str   = ""
+        self.acc = acc
+        self.email = acc.email
+        self.otp: str = ""
         self._cookies: dict = {}
-        self._cfg           = None
-        # 优先从 AccountState 取已保存的邮箱 JWT
+        self._cfg = None
         self._email_jwt: str = getattr(acc, "email_jwt", "")
 
+    async def _refresh_outlook_account(self) -> bool:
+        """使用 Outlook 凭据重新登录"""
+        try:
+            client_id = getattr(self.acc, "client_id", "")
+            refresh_token = getattr(self.acc, "refresh_token", "")
+            if not client_id or not refresh_token:
+                log.warning(f"[{self.email}] 缺少 client_id 或 refresh_token，无法进行 Outlook 保活")
+                return False
+
+            baseline_folders = await asyncio.to_thread(
+                get_folder_highest_uids,
+                self.email,
+                client_id,
+                refresh_token,
+            )
+
+            async with AsyncSession(impersonate=IMPERSONATE, timeout=60, proxy=PROXY or None) as session:
+                otp_request = await self._step_send_email(session, self.email)
+                if not otp_request:
+                    return False
+
+                is_new_user = bool(otp_request.get("newUser"))
+                self.otp = await wait_for_outlook_code(
+                    self.email,
+                    client_id,
+                    refresh_token,
+                    baseline_folders=baseline_folders,
+                    timeout=90,
+                )
+                if not self.otp:
+                    return False
+
+                # 注册与登录统一走 NextAuth credentials
+                user_id = await self._step_nextauth_login(session, self.email, self.otp)
+                if not user_id:
+                    return False
+
+                self.acc.cookie_str = _cookies_dict_to_str(self._cookies)
+                self.acc.user_id = user_id
+                self.acc.healthy = True
+                self.acc.disabled = False
+                self.acc.fail_count = 0
+                return True
+        except Exception as e:
+            log.warning(f"[{self.email}] Outlook 保活重新登录异常: {e}")
+            return False
+
     async def _recover_email_jwt(self) -> str:
-        """
-        当 AccountState 里没有保存 email_jwt，或已知 JWT 过期时，
-        通过管理员接口按邮箱名查 address_id，再调 show_password 取回 JWT。
-        网络超时时不抛出异常，直接返回空字符串。
-        """
         try:
             from app.email_service import EmailService as ES
-            import asyncio
             es = ES()
             name = self.email.split("@")[0]
-            # 整体限时 20s，避免单次超时拖垮保活流程
             jwt, _ = await asyncio.wait_for(
                 asyncio.to_thread(es.recover_email_jwt, name),
                 timeout=20,
             )
             if jwt:
-                log.info(f"[{self.email}] 成功取回 email_jwt")
                 self.acc.email_jwt = jwt
                 self._email_jwt = jwt
             return jwt or ""
         except Exception as e:
-            log.warning(f"[{self.email}] 取回 email_jwt 失败: {e}")
             return ""
 
-    async def _ensure_valid_email_jwt(self) -> str:
-        """
-        验证当前 email_jwt 是否可用（能正常拉到邮件列表），
-        不可用（过期/无效）时自动重新获取一次。
-        返回可用的 JWT 或空字符串。
-        """
-        if not self._email_jwt:
-            log.warning(f"[{self.email}] 无 email_jwt，尝试从邮件服务恢复...")
-            return await self._recover_email_jwt()
-
-        # 快速探测：尝试拉取邮件列表，401/403 → JWT 已过期
-        try:
-            from app.email_service import EmailService as ES
-            import asyncio
-            es = ES()
-
-            def _probe(jwt: str):
-                import requests
-                res = requests.get(
-                    f"https://{es.worker_domain}/api/mails",
-                    params={"limit": 1, "offset": 0},
-                    headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
-                    timeout=8,
-                    verify=False,
-                )
-                return res.status_code
-
-            status = await asyncio.wait_for(
-                asyncio.to_thread(_probe, self._email_jwt),
-                timeout=12,
-            )
-            if status in (200,):
-                return self._email_jwt  # JWT 仍然有效
-
-            log.warning(f"[{self.email}] email_jwt 探测返回 {status}，视为过期，重新获取...")
-        except Exception as e:
-            log.warning(f"[{self.email}] email_jwt 探测异常: {e}，尝试重新获取...")
-
-        # JWT 过期或探测失败 → 重新获取
-        return await self._recover_email_jwt()
-
     async def run(self) -> bool:
-        """
-        执行保活。成功后更新 acc.cookie_str / acc.healthy / acc.disabled。
-        遇到 429 时重新执行完整的 OTP 获取 + 登录流程（最多重试 OTP_RETRY_COUNT 次）。
-        :return: True=成功，False=失败
-        """
         try:
             self._cfg = await fetch_action_config()
 
-            # 确保有可用的邮箱 JWT（自动处理缺失和过期两种情况）
-            self._email_jwt = await self._ensure_valid_email_jwt()
+            # 优先尝试 Outlook 重新登录保活
+            if getattr(self.acc, "client_id", "") and getattr(self.acc, "refresh_token", ""):
+                log.info(f"[{self.email}] 触发 Outlook OAuth IMAP 重新登录保活...")
+                return await self._refresh_outlook_account()
+
+            # 否则尝试 Worker 邮箱保活
             if not self._email_jwt:
-                raise RuntimeError(
-                    f"无法获取 email_jwt（账号 {self.email} 注册时未保存，"
-                    f"且通过管理员接口恢复也失败）。"
-                    f"请检查 WORKER_DOMAIN / ADMIN_PASSWORD 配置，或手动补填 tokens.json 中的 email_jwt 字段。"
-                )
+                self._email_jwt = await self._recover_email_jwt()
+            if not self._email_jwt:
+                return False
 
             email_service = EmailService()
-            max_retries = max(1, int(os.getenv("OTP_RETRY_COUNT", "3")))
-            retry_delay = max(5.0, float(os.getenv("OTP_RETRY_DELAY_SECONDS", "30")))
+            async with AsyncSession(impersonate=IMPERSONATE, timeout=60, proxy=PROXY or None) as session:
+                otp_request = await self._step_send_email(session, self.email)
+                if not otp_request:
+                    return False
 
-            for attempt in range(1, max_retries + 1):
-                async with AsyncSession(impersonate=IMPERSONATE, timeout=60) as session:
-                    # Step 1：触发 OTP 邮件（429 时等待后重试）
-                    otp_request = await self._step_send_email(session, self.email)
-                    if not otp_request:
-                        if attempt < max_retries:
-                            log.warning(
-                                f"[{self.email}] OTP 发送失败（attempt {attempt}/{max_retries}），"
-                                f"{retry_delay}s 后重新执行完整登录流程..."
-                            )
-                            await asyncio.sleep(retry_delay)
-                            continue
-                        raise RuntimeError(f"Step1 发送邮箱失败（已重试 {max_retries} 次）")
+                self.otp = await self._wait_for_otp(email_service, self._email_jwt, self.email)
+                if not self.otp:
+                    return False
 
-                    if otp_request.get("newUser") is True:
-                        raise RuntimeError("站点将该邮箱识别为新用户，无法执行已有账号刷新")
+                user_id = await self._step_nextauth_login(session, self.email, self.otp)
+                if not user_id:
+                    return False
 
-                    # Step 2：等待并读取 OTP
-                    self.otp = await self._wait_for_otp(
-                        email_service, self._email_jwt, self.email
-                    )
-                    if not self.otp:
-                        if attempt < max_retries:
-                            log.warning(
-                                f"[{self.email}] 获取 OTP 超时（attempt {attempt}/{max_retries}），"
-                                f"{retry_delay}s 后重试..."
-                            )
-                            await asyncio.sleep(retry_delay)
-                            continue
-                        raise RuntimeError("获取 OTP 超时")
-
-                    # 新版站点对已有账号不再先调用 verifyOTP；前端会直接把 OTP
-                    # 交给 credentials provider。提前 verify 会消费验证码，导致登录失败。
-                    user_id = await self._step_nextauth_login(
-                        session, self.email, self.otp
-                    )
-                    if not user_id:
-                        if attempt < max_retries:
-                            log.warning(
-                                f"[{self.email}] next-auth 登录失败（attempt {attempt}/{max_retries}），"
-                                f"{retry_delay}s 后重试..."
-                            )
-                            await asyncio.sleep(retry_delay)
-                            continue
-                        raise RuntimeError("Step2 next-auth 登录失败，session 未返回 user_id")
-
-                    # ✅ 写回 AccountState
-                    self.acc.cookie_str = _cookies_dict_to_str(self._cookies)
-                    self.acc.healthy    = True
-                    self.acc.disabled   = False
-                    log.info(f"[{self.email}] ✅ 保活成功，cookie 已更新（attempt {attempt}）")
-                    return True
-
+                self.acc.cookie_str = _cookies_dict_to_str(self._cookies)
+                self.acc.user_id = user_id
+                self.acc.healthy = True
+                self.acc.disabled = False
+                self.acc.fail_count = 0
+                return True
         except Exception as e:
-            log.error(f"[{self.email}] ❌ 保活失败: {e}")
-            import traceback; traceback.print_exc()
+            log.error(f"CosverseRefresher 异常: {e}")
             return False
 
 
@@ -696,7 +712,7 @@ class CosverseRefresher(_LoginMixin):
 def messages_to_text(messages: list[dict]) -> str:
     parts = []
     for msg in messages:
-        role    = msg.get("role", "user")
+        role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
             content = " ".join(c.get("text", "") for c in content if c.get("type") == "text")
@@ -709,20 +725,20 @@ def _build_attachment_list(upload_results: list[dict]) -> list[dict]:
     for r in upload_results:
         if not r:
             continue
-        key        = r.get("key", "")
+        key = r.get("key", "")
         public_url = r.get("publicUrl", "")
-        data_uri   = r.get("dataUri", public_url)
-        filename   = key.split("/")[-1] if key else "file"
-        mime, _    = mimetypes.guess_type(filename)
-        mime       = mime or "application/octet-stream"
-        is_image   = mime.startswith("image/")
+        data_uri = r.get("dataUri", public_url)
+        filename = key.split("/")[-1] if key else "file"
+        mime, _ = mimetypes.guess_type(filename)
+        mime = mime or "application/octet-stream"
+        is_image = mime.startswith("image/")
         attachments.append({
-            "key":         key,
-            "publicUrl":   public_url,
-            "dataUri":     data_uri,
-            "name":        filename,
+            "key": key,
+            "publicUrl": public_url,
+            "dataUri": data_uri,
+            "name": filename,
             "contentType": mime,
-            "type":        "image" if is_image else "file",
+            "type": "image" if is_image else "file",
         })
     return attachments
 
@@ -737,33 +753,33 @@ def _chat_body(
     chat_title: str = "New Chat",
 ) -> dict:
     user_msg = {
-        "role":    "user",
+        "role": "user",
         "content": text,
-        "parts":   [{"type": "text", "text": text}],
+        "parts": [{"type": "text", "text": text}],
     }
 
     if attachments:
         user_msg["experimental_attachments"] = [
             {
-                "url":         att.get("dataUri", att.get("publicUrl", "")),
-                "filename":    att.get("name", "file"),
+                "url": att.get("dataUri", att.get("publicUrl", "")),
+                "filename": att.get("name", "file"),
                 "contentType": att.get("contentType", "image/png"),
             }
             for att in attachments
         ]
 
     return {
-        "id":               conv_id,
-        "messages":         [user_msg],
-        "model":            model,
-        "provider":         provider,
-        "conversationId":   conv_id,
-        "selectedTools":    [],
+        "id": conv_id,
+        "messages": [user_msg],
+        "model": model,
+        "provider": provider,
+        "conversationId": conv_id,
+        "selectedTools": [],
         "guestMessageCount": 1,
-        "userSettings":     {"userName": user_name, "occupation": "", "traits": "", "preferences": ""},
-        "chatTitle":        chat_title,
-        "attachments":      [],
-        "pdfAttachments":   [],
+        "userSettings": {"userName": user_name, "occupation": "", "traits": "", "preferences": ""},
+        "chatTitle": chat_title,
+        "attachments": [],
+        "pdfAttachments": [],
     }
 
 
@@ -815,7 +831,7 @@ async def stream_cosverse_response(
 
     cfg = await fetch_action_config()
 
-    async with AsyncSession(impersonate=IMPERSONATE, timeout=120) as session:
+    async with AsyncSession(impersonate=IMPERSONATE, timeout=120, proxy=PROXY or None) as session:
         chat_title = (
             await _fetch_chat_title(session, text, acc, conv_id, cfg)
             if generate_title else "New Chat"
@@ -826,12 +842,12 @@ async def stream_cosverse_response(
             f"{COSVERSE_API}/chat",
             headers={
                 **COMMON_HEADERS,
-                "accept":         "*/*",
-                "content-type":   "application/json",
+                "accept": "*/*",
+                "content-type": "application/json",
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
-                "referer":        f"{COSVERSE_WEB}/",
+                "referer": f"{COSVERSE_WEB}/",
             },
             json=body,
             cookies=acc.cookies_dict(),
@@ -876,6 +892,7 @@ async def stream_cosverse_response(
         if not yielded_any:
             raise EmptyResponseError(f"empty_response:{acc.email}")
 
+
 # ── 带重试的对话入口（供 chat router 调用）────────────────
 
 async def stream_with_retry(
@@ -885,28 +902,17 @@ async def stream_with_retry(
     attachments: Optional[list[dict]] = None,
     conv_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
-    """
-    带自动重试的流式对话入口。
-    失败策略：
-      1. 当前账号空响应或 cookie 过期 → 对该账号执行 refresh，重试一次；
-      2. refresh 后重试仍失败 → 切换到号池中的下一个账号，再重试一次；
-      3. 连换两个账号都失败 → 注册新账号加入号池，用新账号再试；
-      4. 新账号仍失败 → 抛出最终异常。
-    注意：ServerError（服务端应用层错误，如 invalid_grant）直接透传，不触发任何重试。
-    """
     from app.cookie_manager import cm
 
     _TRANSIENT_ERRORS = (PermissionError, EmptyResponseError)
 
     async def _try_stream(acc: AccountState) -> AsyncIterator[str]:
-        """直接迭代并 yield，异常向上抛出。"""
         async for chunk in stream_cosverse_response(
             text, acc, model, provider, attachments, conv_id
         ):
             yield chunk
 
     async def _refresh_and_retry(acc: AccountState) -> AsyncIterator[str]:
-        """对 acc 执行 refresh，成功则重试流式请求，失败则抛出。"""
         log.warning(f"[{acc.email}] 触发 refresh 后重试...")
         ok = await cm.refresh_account(acc)
         if not ok:
@@ -921,7 +927,6 @@ async def stream_with_retry(
             yield chunk
         return
     except ServerError:
-        # 服务端错误与 cookie 无关，直接向上抛出，不重试
         raise
     except _TRANSIENT_ERRORS as e:
         log.warning(f"首次请求失败（{type(e).__name__}）: {e}")
