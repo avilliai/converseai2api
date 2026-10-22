@@ -373,7 +373,12 @@ async def _collect_full_text(gen) -> str:
 
 def _is_quota_error(exc: Exception) -> bool:
     msg = str(exc).lower()
-    return any(k in msg for k in ("quota", "limit", "429", "too many", "rate limit"))
+    quota_keywords = (
+        "quota", "429", "too many requests", "rate limit", "rate-limit",
+        "rate_limit", "insufficient_quota", "daily limit", "usage limit",
+        "message limit", "exceeded your current"
+    )
+    return any(k in msg for k in quota_keywords)
 
 def _is_auth_error(exc: Exception) -> bool:
     msg = str(exc).lower()
@@ -566,20 +571,21 @@ async def chat_completions(request: Request):
 
                 except Exception as e:
                     last_error = e
-                    if acc and (acc.quota_exhausted or _is_quota_error(e)):
+                    if _is_quota_error(e):
                         log.warning(
-                            "stream attempt %d 配额耗尽 [%s]，换号重试", attempt, acc.email
+                            "stream attempt %d 上游明确配额耗尽/限流 [%s]: %s，换号重试",
+                            attempt, acc.email if acc else "?", e
                         )
-                        try:
-                            # ★ 增加 attempt=attempt 传参
-                            acc = await cm.mark_failed_and_get_replacement(acc, "quota_exhausted", attempt=attempt)
-                        except HTTPException as he:
-                            yield f'data: {{"error": "换号失败: {he.detail}"}}\n\n'
-                            return
+                        if acc:
+                            try:
+                                acc = await cm.mark_failed_and_get_replacement(acc, "quota_exhausted", attempt=attempt)
+                            except HTTPException as he:
+                                yield f'data: {{"error": "换号失败: {he.detail}"}}\n\n'
+                                return
                     elif _is_auth_error(e):
                         log.warning(
-                            "stream attempt %d auth 错误 [%s]，换号重试",
-                            attempt, acc.email if acc else "?",
+                            "stream attempt %d auth 错误 [%s]: %s，换号重试",
+                            attempt, acc.email if acc else "?", e,
                         )
                         if acc:
                             try:
@@ -698,22 +704,23 @@ async def chat_completions(request: Request):
 
         except Exception as e:
             last_error = e
-            if acc and (acc.quota_exhausted or _is_quota_error(e)):
+            if _is_quota_error(e):
                 log.warning(
-                    "non-stream attempt %d 配额耗尽 [%s]，换号重试", attempt, acc.email
+                    "non-stream attempt %d 上游明确配额耗尽/限流 [%s]: %s，换号重试",
+                    attempt, acc.email if acc else "?", e
                 )
-                try:
-                    # ★ 增加 attempt=attempt 传参
-                    acc = await cm.mark_failed_and_get_replacement(acc, "quota_exhausted", attempt=attempt)
-                except HTTPException as he:
-                    return JSONResponse(
-                        status_code=500,
-                        content={"error": {"message": f"换号失败: {he.detail}", "type": "no_account"}},
-                    )
+                if acc:
+                    try:
+                        acc = await cm.mark_failed_and_get_replacement(acc, "quota_exhausted", attempt=attempt)
+                    except HTTPException as he:
+                        return JSONResponse(
+                            status_code=500,
+                            content={"error": {"message": f"换号失败: {he.detail}", "type": "no_account"}},
+                        )
             elif _is_auth_error(e):
                 log.warning(
-                    "non-stream attempt %d auth 错误 [%s]，换号重试",
-                    attempt, acc.email if acc else "?",
+                    "non-stream attempt %d auth 错误 [%s]: %s，换号重试",
+                    attempt, acc.email if acc else "?", e,
                 )
                 if acc:
                     try:

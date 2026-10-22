@@ -26,9 +26,12 @@ class AccountState:
 
     @property
     def remaining(self) -> int:
-        """剩余额度"""
-        limit = self.message_limit if self.message_limit > 0 else ACCOUNT_QUOTA
-        return max(0, limit - self.message_usage)
+        """剩余额度（仅供展示，不作为账号死活的门槛）"""
+        if self.quota_exhausted_flag:
+            return 0
+        if self.message_limit and self.message_limit > 0:
+            return max(0, self.message_limit - self.usage_count)
+        return 999999
 
     @property
     def is_alive(self) -> bool:
@@ -37,11 +40,8 @@ class AccountState:
 
     @property
     def quota_exhausted(self) -> bool:
-        """配额是否已耗尽"""
-        if self.quota_exhausted_flag:
-            return True
-        limit = self.message_limit if self.message_limit > 0 else ACCOUNT_QUOTA
-        return self.message_usage >= limit
+        """配额是否已耗尽：完全取决于上游是否明确返回配额耗尽/限流，绝不根据本地计数值猜测"""
+        return bool(self.quota_exhausted_flag)
 
     def mark_quota_exhausted(self) -> None:
         """标记配额耗尽并设为不可用，保留在账号列表中不删除"""

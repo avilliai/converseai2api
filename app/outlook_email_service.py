@@ -266,7 +266,12 @@ async def wait_for_outlook_code(
 
 
 class OutlookAccountPool:
-    """管理 outlook_live_...txt 账号池，持久化当前指针，支持循环轮询"""
+    """管理 outlook_live_...txt 账号池，支持：
+    1. 状态持久化（已用账号、重试队列、失效账号、新号游标）
+    2. 历史遗漏账号自愈（自动拾回因临时网络波动跳过的账号，绝不浪费）
+    3. 优先级取号（优先重试临时网络波动未成功的账号，其次扫描新号，不单纯用递增 index）
+    4. 两阶段确认机制（mark_success / mark_failed，网络失败安全放回重试池）
+    """
 
     def __init__(
         self,
@@ -276,8 +281,16 @@ class OutlookAccountPool:
         self.account_file = Path(account_file)
         self.pointer_file = Path(pointer_file)
         self.accounts: list[tuple[str, str, str, str]] = []
+        self.email_to_account: dict[str, tuple[str, str, str, str, int]] = {}
+        self.current_index: int = 0
+        self.used_emails: set[str] = set()
+        self.retry_queue: dict[str, dict] = {}
+        self.invalid_emails: dict[str, dict] = {}
+        self.in_flight: set[str] = set()
         self._lock = asyncio.Lock()
+        
         self._load_accounts()
+        self._load_state()
 
     def _load_accounts(self) -> None:
         if not self.account_file.exists():
@@ -289,27 +302,74 @@ class OutlookAccountPool:
             for line in f:
                 parts = line.strip().split("----", 3)
                 if len(parts) == 4:
-                    accs.append((parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()))
+                    email = parts[0].strip()
+                    pwd = parts[1].strip()
+                    cid = parts[2].strip()
+                    rtok = parts[3].strip()
+                    idx = len(accs)
+                    accs.append((email, pwd, cid, rtok))
+                    self.email_to_account[email.lower()] = (email, pwd, cid, rtok, idx)
         if not accs:
             raise ValueError(f"Outlook account file is empty: {self.account_file}")
         self.accounts = accs
         log.info(f"Loaded {len(self.accounts)} accounts from {self.account_file}")
 
-    def load_pointer(self) -> int:
+    def _sync_with_tokens_file(self) -> None:
+        """从 cosverse_tokens.json 同步当前已经在使用的 Outlook 账号"""
+        from app.config import TOKENS_FILE
+        if TOKENS_FILE.exists():
+            try:
+                data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
+                acc_list = data.get("accounts", []) if isinstance(data, dict) else data
+                for a in acc_list:
+                    em = a.get("email", "").strip().lower()
+                    if em and "@outlook" in em:
+                        self.used_emails.add(em)
+            except Exception as e:
+                log.warning(f"同步 tokens 文件账号失败: {e}")
+
+    def _load_state(self) -> None:
         if self.pointer_file.exists():
             try:
                 data = json.loads(self.pointer_file.read_text(encoding="utf-8"))
-                return int(data.get("current_index", 0))
+                self.current_index = int(data.get("current_index", 0))
+                self.used_emails = set(e.lower() for e in data.get("used_emails", []))
+                self.retry_queue = {k.lower(): v for k, v in data.get("retry_queue", {}).items()}
+                self.invalid_emails = {k.lower(): v for k, v in data.get("invalid_emails", {}).items()}
             except Exception as e:
                 log.warning(f"Failed to read pointer file: {e}")
-        return 0
+                self.current_index = 0
 
-    def save_pointer(self, index: int, last_email: str = "") -> None:
+        # 同步 tokens 文件中已经在用的账号
+        self._sync_with_tokens_file()
+
+        # 历史遗漏账号自愈扫描：
+        # 扫描从 0 到 current_index 之间因过去网络波动或中断被跳过的账号，自动收纳至待重试队列，绝不浪费
+        recovered = 0
+        limit_scan = min(self.current_index, len(self.accounts))
+        for i in range(limit_scan):
+            em = self.accounts[i][0].strip().lower()
+            if em not in self.used_emails and em not in self.invalid_emails and em not in self.retry_queue:
+                self.retry_queue[em] = {
+                    "fail_count": 0,
+                    "last_error": "previously_skipped_by_index",
+                    "last_try": 0,
+                }
+                recovered += 1
+
+        if recovered > 0:
+            log.info(f"♻️ [Outlook] 自动拾回历史因网络波动/跳过而未使用的账号 {recovered} 个进入重试待选池")
+            self._save_state()
+
+    def _save_state(self, last_email: str = "") -> None:
         try:
             data = {
-                "current_index": index,
+                "current_index": self.current_index,
                 "last_email": last_email,
                 "total_accounts": len(self.accounts),
+                "used_emails": sorted(list(self.used_emails)),
+                "retry_queue": self.retry_queue,
+                "invalid_emails": self.invalid_emails,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             self.pointer_file.write_text(
@@ -319,31 +379,139 @@ class OutlookAccountPool:
             log.warning(f"Failed to save pointer file: {e}")
 
     async def get_next_account(self) -> OutlookAccount:
-        """获取下一个 Outlook 账号并递增指针，指针在 0 ~ total-1 之间循环"""
+        """
+        智能获取下一个可用 Outlook 账号：
+        1. 优先从 retry_queue（因网络抖动未成功的账号）中取出重试，避免账号浪费；
+        2. 其次顺着游标扫描尚未被使用的新账号；
+        3. 两阶段确认：取出时占位防并发，完成或失败后通知 pool。
+        """
         async with self._lock:
-            curr_idx = self.load_pointer()
-            if curr_idx >= len(self.accounts):
-                curr_idx = 0
-            
-            email, pwd, cid, rtok = self.accounts[curr_idx]
-            next_idx = (curr_idx + 1) % len(self.accounts)
-            self.save_pointer(next_idx, email)
-            return OutlookAccount(
-                address=email,
-                password=pwd,
-                client_id=cid,
-                refresh_token=rtok,
-                index=curr_idx,
-            )
+            now = time.time()
+
+            # 优先级 1: 检查重试队列中因网络波动失败的账号
+            # 规则：未在处理中，重试未超 5 次，冷却时间超过 15 秒
+            for em, info in list(self.retry_queue.items()):
+                if em in self.in_flight:
+                    continue
+                fail_cnt = info.get("fail_count", 0)
+                last_try = info.get("last_try", 0)
+                if fail_cnt < 5 and (now - last_try >= 15):
+                    raw = self.email_to_account.get(em)
+                    if raw:
+                        self.in_flight.add(em)
+                        email, pwd, cid, rtok, idx = raw
+                        log.info(
+                            f"🔄 [Outlook] 拾回/重试因网络波动未成功的账号: {email} "
+                            f"(重试第 {fail_cnt + 1} 次，上次原因: {info.get('last_error', 'unknown')})"
+                        )
+                        return OutlookAccount(
+                            address=email,
+                            password=pwd,
+                            client_id=cid,
+                            refresh_token=rtok,
+                            index=idx,
+                        )
+
+            # 优先级 2: 从游标扫描全新的未用账号
+            total = len(self.accounts)
+            for _ in range(total):
+                curr_idx = self.current_index % total
+                email, pwd, cid, rtok = self.accounts[curr_idx]
+                em = email.lower()
+                self.current_index = (curr_idx + 1) % total
+
+                if (
+                    em in self.used_emails
+                    or em in self.invalid_emails
+                    or em in self.retry_queue
+                    or em in self.in_flight
+                ):
+                    # 已用或已在队列中，继续向前扫描
+                    continue
+
+                # 找到未用新账号
+                self.in_flight.add(em)
+                self._save_state(last_email=email)
+                log.info(f"🆕 [Outlook] 选取全新账号: {email} (游标推进至 {self.current_index})")
+                return OutlookAccount(
+                    address=email,
+                    password=pwd,
+                    client_id=cid,
+                    refresh_token=rtok,
+                    index=curr_idx,
+                )
+
+            # 优先级 3: 兜底情况（全池账号均已尝试过），从 retry_queue 选取重试次数最多的账号再试一次
+            for em in self.retry_queue:
+                if em not in self.in_flight:
+                    raw = self.email_to_account.get(em)
+                    if raw:
+                        self.in_flight.add(em)
+                        email, pwd, cid, rtok, idx = raw
+                        log.warning(f"⚠️ [Outlook] 全池扫描完毕，兜底复用重试账号: {email}")
+                        return OutlookAccount(
+                            address=email,
+                            password=pwd,
+                            client_id=cid,
+                            refresh_token=rtok,
+                            index=idx,
+                        )
+
+            # 若完全无可取账号，抛出明确异常
+            raise RuntimeError("Outlook 账号池中所有账号均已使用或正在处理中，无可用的候选账号")
+
+    async def mark_success(self, email: str) -> None:
+        """账号注册/激活成功确认：登记为已用并移出重试池"""
+        async with self._lock:
+            em = email.lower()
+            self.in_flight.discard(em)
+            self.used_emails.add(em)
+            self.retry_queue.pop(em, None)
+            self._save_state(last_email=email)
+            log.info(f"✅ [Outlook] 账号成功登记为可用: {email} (已从待重试池移除)")
+
+    async def mark_failed(self, email: str, error: str, is_permanent: bool = False) -> None:
+        """账号注册/激活失败反馈：临时网络错误安全放回重试池，绝不浪费丢号"""
+        async with self._lock:
+            em = email.lower()
+            self.in_flight.discard(em)
+            if is_permanent:
+                self.invalid_emails[em] = {
+                    "reason": error,
+                    "marked_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self.retry_queue.pop(em, None)
+                log.warning(f"🚫 [Outlook] 账号已被微软/认证明确拒绝，标记为永久失效: {email} (原因: {error})")
+            else:
+                info = self.retry_queue.get(em, {"fail_count": 0})
+                info["fail_count"] = info.get("fail_count", 0) + 1
+                info["last_error"] = str(error)[:200]
+                info["last_try"] = time.time()
+                self.retry_queue[em] = info
+                log.warning(
+                    f"⚠️ [Outlook] 账号因临时网络波动未成功，已安全保留在重试队列中: {email} "
+                    f"(累计重试 {info['fail_count']} 次, 原因: {error})"
+                )
+            self._save_state(last_email=email)
 
     async def get_account_by_email(self, email: str) -> Optional[OutlookAccount]:
-        for i, acc in enumerate(self.accounts):
-            if acc[0].lower() == email.lower():
-                return OutlookAccount(
-                    address=acc[0],
-                    password=acc[1],
-                    client_id=acc[2],
-                    refresh_token=acc[3],
-                    index=i,
-                )
+        raw = self.email_to_account.get(email.lower())
+        if raw:
+            return OutlookAccount(
+                address=raw[0],
+                password=raw[1],
+                client_id=raw[2],
+                refresh_token=raw[3],
+                index=raw[4],
+            )
         return None
+
+
+# 单例管理
+_pool_singleton: Optional[OutlookAccountPool] = None
+
+def get_outlook_pool() -> OutlookAccountPool:
+    global _pool_singleton
+    if _pool_singleton is None:
+        _pool_singleton = OutlookAccountPool()
+    return _pool_singleton

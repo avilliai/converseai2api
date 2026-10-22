@@ -25,6 +25,7 @@ from app.email_service import EmailService
 from app.outlook_email_service import (
     OutlookAccount,
     OutlookAccountPool,
+    get_outlook_pool,
     get_folder_highest_uids,
     wait_for_outlook_code,
 )
@@ -488,7 +489,7 @@ class CosverseRegister(_LoginMixin):
             baseline_folders = {'"Junk"': 0, "INBOX": 0}
             if not self.outlook_acc:
                 try:
-                    pool = OutlookAccountPool()
+                    pool = get_outlook_pool()
                     self.outlook_acc = await pool.get_next_account()
                 except Exception as e:
                     log.warning(f"从 Outlook 账号池取号失败或文件不存在: {e}")
@@ -577,10 +578,24 @@ class CosverseRegister(_LoginMixin):
                 account["email_jwt"] = self._jwt
 
             log.info(f"[{self.email}] ✅ 注册/登录成功 user_id={self.user_id}")
+            if is_outlook and self.outlook_acc:
+                try:
+                    pool = get_outlook_pool()
+                    await pool.mark_success(self.outlook_acc.address)
+                except Exception as ex:
+                    log.warning(f"登记 Outlook 账号成功状态失败: {ex}")
             return account
 
         except Exception as e:
             log.error(f"CosverseRegister.run() 失败: {e}")
+            if is_outlook and self.outlook_acc:
+                try:
+                    pool = get_outlook_pool()
+                    err_str = str(e).lower()
+                    is_perm = any(k in err_str for k in ("invalid_grant", "bad credentials", "account disabled", "user not found", "user disabled"))
+                    await pool.mark_failed(self.outlook_acc.address, str(e), is_permanent=is_perm)
+                except Exception as ex:
+                    log.warning(f"登记 Outlook 账号失败状态异常: {ex}")
             import traceback
             traceback.print_exc()
             return None

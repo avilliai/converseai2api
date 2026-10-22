@@ -711,7 +711,7 @@ class CookieManager:
 
         '''
         self.save()
-        log.info(f"📈 [{acc.email}] 已用: {acc.usage_count}/{ACCOUNT_MAX_USAGE}")
+        log.info(f"📈 [{acc.email}] 调用成功，当前累计请求数: {acc.usage_count}")
 
     # ── 账号 session 检查（usage 余额探测） ─────────────
     async def check_session(self, acc: AccountState, save: bool = True) -> bool:
@@ -731,10 +731,7 @@ class CookieManager:
                 acc.message_limit = int(limits.get("messageLimit", acc.message_limit) or 0)
                 acc.message_usage = int(limits.get("messageUsage", acc.message_usage) or 0)
                 acc.usage_count = acc.message_usage
-                if acc.message_usage < acc.message_limit:
-                    acc.mark_quota_recovered()
-                else:
-                    acc.mark_quota_exhausted()
+                acc.mark_quota_recovered()
             else:
                 acc.healthy = False
             if save:
