@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 
 # ─────────────────────────── 鉴权配置 ────────────────────
-API_KEY = os.getenv("PROXY_API_KEY", "123456")
+API_KEY = os.getenv("PROXY_API_KEY", "cosverse")
 if not API_KEY:
     logging.warning("⚠️  未设置 PROXY_API_KEY，所有请求将被拒绝")
 
